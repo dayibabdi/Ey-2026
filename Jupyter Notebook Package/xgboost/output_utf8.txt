@@ -1,0 +1,16 @@
+﻿Loading data...
+Training data size: 9319 rows
+Preprocessing data...
+Using features: ['Latitude', 'Longitude', 'nir', 'green', 'swir16', 'swir22', 'NDMI', 'MNDWI', 'pet', 'Month', 'Year', 'DayOfYear']
+
+Training XGBoost model for Total Alkalinity...
+Average CV R2 for Total Alkalinity: 0.8560
+
+Training XGBoost model for Electrical Conductance...
+Average CV R2 for Electrical Conductance: 0.8731
+
+Training XGBoost model for Dissolved Reactive Phosphorus...
+Average CV R2 for Dissolved Reactive Phosphorus: 0.7121
+
+Overall Final CV average R2: 0.8137
+Improved submission saved to c:\Users\hp\Desktop\Ey challenge\Jupyter Notebook Package\Jupyter Notebook Package\improved_submission_full.csv
