@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor, VotingRegressor
+from xgboost import XGBRegressor
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import os
 import joblib
@@ -25,8 +26,8 @@ TERRA_VAL = os.path.join(DATA_DIR, "terraclimate_features_validation.csv")
 # Targets
 TARGETS = ["Total Alkalinity", "Electrical Conductance", "Dissolved Reactive Phosphorus"]
 
-# Features (Optimization: Added Lat/Lon, Dates, Spectral Indices)
-FEATURES = [
+# Base Features
+BASE_FEATURES = [
     "Latitude", "Longitude", 
     "nir", "green", "swir16", "swir22", 
     "NDMI", "MNDWI", "pet", 
@@ -39,8 +40,7 @@ def setup_directories():
 
 def preprocess_and_merge(base_df, landsat_df, terra_df, is_submission=False):
     """
-    Robustly merges datasets and extracts date features.
-    NO median imputation - lets HistGradientBoostingRegressor handle NaNs natively.
+    Robustly merges datasets and extracts date features + Spectral Ratios.
     """
     # 1. Standardize column names
     for df in [base_df, landsat_df, terra_df]:
@@ -50,18 +50,28 @@ def preprocess_and_merge(base_df, landsat_df, terra_df, is_submission=False):
     for df in [base_df, landsat_df, terra_df]:
         df['Sample Date'] = pd.to_datetime(df['Sample Date'], format='%d-%m-%Y', errors='coerce')
 
-    # 3. Robust Merge (Inner Join)
-    # We join base_df with landsat, then with terra
+    # 3. Robust Merge (LEFT JOIN)
     print(f"Merging datasets... Initial base shape: {base_df.shape}")
-    merged = pd.merge(base_df, landsat_df, on=['Latitude', 'Longitude', 'Sample Date'], how='inner')
-    merged = pd.merge(merged, terra_df, on=['Latitude', 'Longitude', 'Sample Date'], how='inner')
+    merged = pd.merge(base_df, landsat_df, on=['Latitude', 'Longitude', 'Sample Date'], how='left')
+    merged = pd.merge(merged, terra_df, on=['Latitude', 'Longitude', 'Sample Date'], how='left')
     print(f"Merged shape: {merged.shape}")
     
-    # 4. Feature Engineering
+    # 4. Feature Engineering: Extracts
     merged['Month'] = merged['Sample Date'].dt.month
     merged['DayOfYear'] = merged['Sample Date'].dt.dayofyear
-    
-    # Optimization: Do NOT fillna. HistGradientBoostingRegressor handles it better.
+
+    # 5. ADVANCED FEATURE ENGINEERING: Spectral Ratios
+    # Ratios capture physical relationships better than raw values
+    with np.errstate(divide='ignore', invalid='ignore'):
+        merged['Ratio_NIR_Green'] = merged['nir'] / merged['green']
+        merged['Ratio_NIR_SWIR16'] = merged['nir'] / merged['swir16']
+        merged['Ratio_Green_SWIR22'] = merged['green'] / merged['swir22']
+        
+        # Spectral Difference (Change in energy)
+        merged['Diff_SWIR'] = merged['swir22'] - merged['swir16']
+        
+    # Handle infinities/NaNs from division
+    merged.replace([np.inf, -np.inf], np.nan, inplace=True)
     
     return merged
 
@@ -99,69 +109,76 @@ def prep_prediction_data():
     print(f"Saved: {output_path}")
     return test_final
 
-def train_and_evaluate(train_df):
-    print("\n[STEP 3] Training & Evaluation...")
+def get_ensemble_model():
+    """Returns a Voting Ensemble of HistGBM and XGBoost."""
+    hgbm = HistGradientBoostingRegressor(
+        max_iter=1500, 
+        learning_rate=0.04, 
+        max_depth=12, 
+        l2_regularization=0.1,
+        random_state=42
+    )
     
-    # Sort by date for proper time-based splitting
+    xgb = XGBRegressor(
+        n_estimators=1000,
+        learning_rate=0.03,
+        max_depth=8,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        n_jobs=-1
+    )
+    
+    return VotingRegressor(estimators=[
+        ('hgbm', hgbm),
+        ('xgb', xgb)
+    ])
+
+def train_and_evaluate(train_df):
+    print("\n[STEP 3] Training & Evaluation with ADVANCED ENSEMBLE...")
+    
     train_df = train_df.sort_values(by="Sample Date").reset_index(drop=True)
     
-    # Verify features exist
-    available_features = [f for f in FEATURES if f in train_df.columns]
-    print(f"Features used: {available_features}")
+    # Identify features including new ratios
+    new_features = ["Ratio_NIR_Green", "Ratio_NIR_SWIR16", "Ratio_Green_SWIR22", "Diff_SWIR"]
+    current_features = [f for f in (BASE_FEATURES + new_features) if f in train_df.columns]
+    print(f"Features used: {current_features}")
     
-    X_full = train_df[available_features]
+    X_full = train_df[current_features]
     
-    # Storage for detailed scores
     scores = {}
 
     for target in TARGETS:
         print(f"\n--- Modelling Target: {target} ---")
         y_full = train_df[target]
+        y_full_log = np.log1p(y_full)
 
-        # ---------------------------------------------------------
-        # A) Time-Based Validation Split (Last 20% by time)
-        # ---------------------------------------------------------
+        # A) Time-Based Validation Split
         split_idx = int(len(train_df) * 0.8)
         X_train, X_val = X_full.iloc[:split_idx], X_full.iloc[split_idx:]
-        y_train, y_val = y_full.iloc[:split_idx], y_full.iloc[split_idx:]
+        y_train_log, y_val_log = y_full_log.iloc[:split_idx], y_full_log.iloc[split_idx:]
+        y_val_real = y_full.iloc[split_idx:]
         
-        # HistGradientBoostingRegressor natively handles NaNs (missing values)
-        # and doesn't require scaling.
-        val_model = HistGradientBoostingRegressor(
-            max_iter=1000, 
-            learning_rate=0.05, 
-            max_depth=10, 
-            random_state=42
-        )
-        val_model.fit(X_train, y_train)
+        val_model = get_ensemble_model()
+        val_model.fit(X_train, y_train_log)
         
-        y_pred = val_model.predict(X_val)
+        y_pred_log = val_model.predict(X_val)
+        y_pred_real = np.expm1(y_pred_log)
         
-        # Metrics
-        r2 = r2_score(y_val, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_val, y_pred))
-        mae = mean_absolute_error(y_val, y_pred)
+        r2 = r2_score(y_val_real, y_pred_real)
+        rmse = np.sqrt(mean_squared_error(y_val_real, y_pred_real))
         
-        print(f"Validation Results (Time-Based Split):")
-        print(f"  R2 Score: {r2:.4f} (Target: 1.0)")
+        print(f"Validation Results (Ensemble + Log + Ratios):")
+        print(f"  R2 Score: {r2:.4f}")
         print(f"  RMSE:     {rmse:.4f}")
-        print(f"  MAE:      {mae:.4f}")
         
         scores[target] = r2
 
-        # ---------------------------------------------------------
         # B) Final Training on ALL Data
-        # ---------------------------------------------------------
-        print(f"Retraining on full dataset ({len(train_df)} rows)...")
-        final_model = HistGradientBoostingRegressor(
-            max_iter=1500,  # Increased slightly for final model
-            learning_rate=0.04, 
-            max_depth=12, 
-            random_state=42
-        )
-        final_model.fit(X_full, y_full)
+        print(f"Retraining final ensemble on full dataset ({len(train_df)} rows)...")
+        final_model = get_ensemble_model()
+        final_model.fit(X_full, y_full_log)
         
-        # Save Model
         safe_name = target.replace(" ", "_").lower()
         model_path = os.path.join(MODEL_DIR, f"model_{safe_name}.joblib")
         joblib.dump(final_model, model_path)
@@ -179,48 +196,38 @@ def generate_submission(test_df):
         print("Error: No prediction data available.")
         return
 
-    # Prepare features
-    available_features = [f for f in FEATURES if f in test_df.columns]
-    X_test = test_df[available_features]
+    # Prepare features including new ratios
+    new_features = ["Ratio_NIR_Green", "Ratio_NIR_SWIR16", "Ratio_Green_SWIR22", "Diff_SWIR"]
+    current_features = [f for f in (BASE_FEATURES + new_features) if f in test_df.columns]
+    X_test = test_df[current_features]
     
-    # We need to maintain the original rows for the submission file
     submission_df = test_df[['Latitude', 'Longitude', 'Sample Date']].copy()
     
-    # Load models and predict
     for target in TARGETS:
         safe_name = target.replace(" ", "_").lower()
         model_path = os.path.join(MODEL_DIR, f"model_{safe_name}.joblib")
         
         if not os.path.exists(model_path):
-            print(f"Error: Model not found for {target} at {model_path}")
+            print(f"Error: Model not found for {target}")
             continue
             
         model = joblib.load(model_path)
-        submission_df[target] = model.predict(X_test)
+        
+        pred_log = model.predict(X_test)
+        pred_real = np.expm1(pred_log)
+        pred_real = np.maximum(pred_real, 0) # Physical clipping
+        
+        submission_df[target] = pred_real
     
-    # Format Sample Date back to string if needed for submission format
-    # The original template uses 'DD-MM-YYYY' usually, let's ensure we match the input format roughly
-    # submission_df['Sample Date'] = submission_df['Sample Date'].dt.strftime('%d-%m-%Y') 
-    
-    # Save
     submission_df.to_csv(SUBMISSION_PATH, index=False)
     print(f"\nSUCCESS: Submission file generated at: {SUBMISSION_PATH}")
 
 def main():
     setup_directories()
-    
-    # 1. Prep Data
     train_df = prep_training_data()
     test_df = prep_prediction_data()
-    
-    if train_df is None or test_df is None:
-        print("Stopping due to data loading errors.")
-        return
-        
-    # 2. Train & Eval
+    if train_df is None or test_df is None: return
     train_and_evaluate(train_df)
-    
-    # 3. Predict
     generate_submission(test_df)
 
 if __name__ == "__main__":
