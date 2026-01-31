@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import HistGradientBoostingRegressor, VotingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor, VotingRegressor, RandomForestRegressor
 from xgboost import XGBRegressor
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import os
@@ -40,17 +40,14 @@ def setup_directories():
 
 def preprocess_and_merge(base_df, landsat_df, terra_df, is_submission=False):
     """
-    Robustly merges datasets with coordinate rounding and spectral ratios.
+    Robustly merges datasets with high-precision coordinates and handles missing values.
     """
     # 1. Standardize column names
     for df in [base_df, landsat_df, terra_df]:
         df.columns = df.columns.str.strip()
     
-    # 2. COORDINATE ROUNDING: Critical for matching between different data sources.
-    # Prevents silent join failures due to precision differences.
-    for df in [base_df, landsat_df, terra_df]:
-        df['Latitude'] = df['Latitude'].round(4)
-        df['Longitude'] = df['Longitude'].round(4)
+    # 2. COORDINATE ROUNDING: (REMOVED)
+    # The user requested no rounding to maintain high precision.
     
     # 3. Date Handling
     for df in [base_df, landsat_df, terra_df]:
@@ -82,6 +79,12 @@ def preprocess_and_merge(base_df, landsat_df, terra_df, is_submission=False):
             merged['Diff_SWIR'] = merged['swir22'] - merged['swir16']
         
     merged.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # 8. MEDIAN IMPUTATION: Critical for models like RandomForest that don't handle NaNs.
+    # We use numeric medians from the dataset to fill gaps.
+    print("Filling missing values with medians...")
+    numeric_cols = merged.select_dtypes(include=[np.number]).columns
+    merged[numeric_cols] = merged[numeric_cols].fillna(merged[numeric_cols].median())
     
     return merged
 
@@ -120,13 +123,13 @@ def prep_prediction_data():
     return test_final
 
 def get_base_model():
-    """Returns a robust HistGradientBoostingRegressor Baseline."""
-    return HistGradientBoostingRegressor(
-        max_iter=1000, 
-        learning_rate=0.05, 
-        max_depth=10, 
-        l2_regularization=0.1,
-        random_state=42
+    """Returns a Random Forest Regressor as requested."""
+    return RandomForestRegressor(
+        n_estimators=100,
+        max_depth=15,
+        min_samples_leaf=2,
+        random_state=42,
+        n_jobs=-1
     )
 
 def train_and_evaluate(train_df):
