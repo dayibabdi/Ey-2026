@@ -171,6 +171,46 @@ def train_and_evaluate(train_df):
         safe_name = target.replace(" ", "_").lower()
         model_path = os.path.join(MODEL_DIR, f"model_{safe_name}.joblib")
         joblib.dump(final_model, model_path)
+        print(f"Saved: {model_path}")
+
+    # C) Save Consolidated Information File (.txt)
+    summary_path = os.path.join(MODEL_DIR, "models_summary.txt")
+    with open(summary_path, "w") as f:
+        f.write("CONSOLIDATED WATER QUALITY MODELS SUMMARY & PIPELINE REPORT\n")
+        f.write("="*60 + "\n\n")
+        
+        f.write("STEP 1: DATA PIPELINE & LOADING\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"1. Loading Base Data: {os.path.basename(WQA_TRAIN)}\n")
+        f.write(f"2. Loading Landsat Features: {os.path.basename(LANDSAT_TRAIN)}\n")
+        f.write(f"3. Loading TerraClimate Features: {os.path.basename(TERRA_TRAIN)}\n")
+        f.write("4. Merging on ['Latitude', 'Longitude', 'Sample Date'] (Left Join)\n")
+        f.write("5. Handling Missing Values: Median Imputation (Numeric Only)\n")
+        f.write(f"Total Combined Samples for Learning: {len(train_df)}\n\n")
+
+        f.write("STEP 2: MODEL ARCHITECTURE\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"Model Type: Random Forest Regressor\n")
+        f.write(f"Features Used ({len(current_features)}):\n")
+        for feat in current_features:
+            f.write(f"  - {feat}\n")
+        f.write("\n")
+
+        f.write("STEP 3: TARGET MODELLING RESULTS\n")
+        f.write("-" * 30 + "\n")
+        
+        # We assume 80/20 split as defined in code
+        train_size = int(len(train_df) * 0.8)
+        val_size = len(train_df) - train_size
+        
+        for target, score in scores.items():
+            f.write(f"Target: {target}\n")
+            f.write(f"  - Samples used for Learning (Training): {train_size}\n")
+            f.write(f"  - Samples used for Testing (Validation): {val_size}\n")
+            f.write(f"  - Validation R2 Score: {score:.4f}\n")
+            f.write("."*40 + "\n")
+            
+    print(f"Saved: {summary_path}")
 
     print("\nOverall Performance Summary (R2):")
     for t, s in scores.items():
@@ -200,6 +240,19 @@ def generate_submission(test_df):
         submission_df[target] = np.maximum(pred, 0)
     
     submission_df.to_csv(SUBMISSION_PATH, index=False)
+    
+    # STEP 4: PREDICTION STATISTICS (Append to Summary)
+    summary_path = os.path.join(MODEL_DIR, "models_summary.txt")
+    with open(summary_path, "a") as f:
+        f.write("\nSTEP 4: SUBMISSION PREDICTION\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"1. Total Rows Predicted (Submission): {len(submission_df)}\n")
+        for target in TARGETS:
+            non_zero = (submission_df[target] > 0).sum()
+            f.write(f"  - {target}: {len(submission_df)} rows predicted ({non_zero} non-zero values)\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"SUCCESS: Submission file generated at: {SUBMISSION_PATH}\n")
+
     print(f"\nSUCCESS: Submission file generated at: {SUBMISSION_PATH}")
 
 def main():
