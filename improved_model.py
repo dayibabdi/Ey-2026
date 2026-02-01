@@ -80,10 +80,14 @@ def preprocess_and_merge(base_df, landsat_df, terra_df, is_submission=False):
         
     merged.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    # 8. MEDIAN IMPUTATION: Critical for models like RandomForest that don't handle NaNs.
-    # We use numeric medians from the dataset to fill gaps.
-    print("Filling missing values with medians...")
+    # 8. SPATIAL MEDIAN IMPUTATION: Filling gaps using medians from same locations.
+    print("Performing Spatial Median Imputation...")
     numeric_cols = merged.select_dtypes(include=[np.number]).columns
+    # Calculate group medians based on location
+    group_medians = merged.groupby(['Latitude', 'Longitude'])[numeric_cols].transform('median')
+    # Fill with group medians
+    merged[numeric_cols] = merged[numeric_cols].fillna(group_medians)
+    # Fallback to global median for any remaining NaNs (locations with no data at all)
     merged[numeric_cols] = merged[numeric_cols].fillna(merged[numeric_cols].median())
     
     return merged
@@ -123,13 +127,16 @@ def prep_prediction_data():
     return test_final
 
 def get_base_model():
-    """Returns a Random Forest Regressor as requested."""
-    return RandomForestRegressor(
-        n_estimators=100,
-        max_depth=15,
-        min_samples_leaf=2,
+    """Returns an XGBoost Regressor."""
+    return XGBRegressor(
+        n_estimators=1000,
+        learning_rate=0.05,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        n_jobs=-1,
         random_state=42,
-        n_jobs=-1
+        verbosity=0
     )
 
 def train_and_evaluate(train_df):
@@ -185,12 +192,12 @@ def train_and_evaluate(train_df):
         f.write(f"2. Loading Landsat Features: {os.path.basename(LANDSAT_TRAIN)}\n")
         f.write(f"3. Loading TerraClimate Features: {os.path.basename(TERRA_TRAIN)}\n")
         f.write("4. Merging on ['Latitude', 'Longitude', 'Sample Date'] (Left Join)\n")
-        f.write("5. Handling Missing Values: Median Imputation (Numeric Only)\n")
+        f.write("5. Handling Missing Values: Spatial Median Imputation (Grouped by Lat/Lon)\n")
         f.write(f"Total Combined Samples for Learning: {len(train_df)}\n\n")
 
         f.write("STEP 2: MODEL ARCHITECTURE\n")
         f.write("-" * 30 + "\n")
-        f.write(f"Model Type: Random Forest Regressor\n")
+        f.write(f"Model Type: XGBoost Regressor (XGBRegressor)\n")
         f.write(f"Features Used ({len(current_features)}):\n")
         for feat in current_features:
             f.write(f"  - {feat}\n")
